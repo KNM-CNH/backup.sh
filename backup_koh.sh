@@ -33,7 +33,11 @@ NC='\033[0m' # No Color
 cleanup_on_error() {
     echo -e "${RED}[!] Skript wurde unterbrochen oder ein Fehler trat auf.${NC}"
     echo -e "${YELLOW}[!] Aufräumen...${NC}"
-    # Hier könnten temporäre Dateien gelöscht werden
+    # Prüfe, ob das aktuelle Backup-Verzeichnis existiert und leer ist, und lösche es ggf.
+    if [[ -n "${BACKUP_DIR:-}" && -d "$BACKUP_DIR" && -z "$(ls -A "$BACKUP_DIR")" ]]; then
+        echo -e "${YELLOW}[!] Lösche leeres Backup-Verzeichnis: $BACKUP_DIR${NC}"
+        rm -rf "$BACKUP_DIR"
+    fi
     exit 1
 }
 
@@ -97,8 +101,13 @@ create_metadata() {
         echo "Datum: $(date)"
         echo "Skript-Version: 2.0"
         echo "Komprimierungsstufe: $COMPRESSION_LEVEL"
+        # DB-Backup ist immer vorhanden
         echo "Größe DB-Backup: $(du -h "$db_backup_path" | cut -f1)"
-        echo "Größe Web-Backup: $(du -h "$web_backup_path" | cut -f1)"
+        # Web-Backup ist optional
+        if [[ -f "$web_backup_path" ]]; then
+            echo "Größe Web-Backup: $(du -h "$web_backup_path" | cut -f1)"
+        fi
+        # Media-Backup ist optional
         if [[ -f "$media_backup_path" ]]; then
             echo "Größe Media-Backup: $(du -h "$media_backup_path" | cut -f1)"
         fi
@@ -125,17 +134,30 @@ select PROJECT_DIR in $(ls -d ~/public_html/*/ | xargs -n 1 basename); do
 done
 
 # --- Backup-Modus auswählen ---
-log_message "INFO" "Soll das Backup alle Dateien enthalten (inkl. Medien)? (Y/N)"
-read -r CHOICE
-
-if [[ "$CHOICE" =~ ^[Yy]$ ]]; then
-    MODE="all"
-elif [[ "$CHOICE" =~ ^[Nn]$ ]]; then
-    MODE="no-media"
-else
-    log_message "ERROR" "Ungültige Eingabe! Bitte mit Y oder N antworten."
-    exit 1
-fi
+log_message "INFO" "Wähle den Backup-Modus aus:"
+options=("Alles (Web + Media)" "Nur Web" "Nur Media")
+select opt in "${options[@]}"; do
+    case $opt in
+        "Alles (Web + Media)")
+            BACKUP_MODE="all"
+            log_message "INFO" "Modus 'Alles' ausgewählt."
+            break
+            ;;
+        "Nur Web")
+            BACKUP_MODE="web_only"
+            log_message "INFO" "Modus 'Nur Web' ausgewählt."
+            break
+            ;;
+        "Nur Media")
+            BACKUP_MODE="media_only"
+            log_message "INFO" "Modus 'Nur Media' ausgewählt."
+            break
+            ;;
+        *)
+            log_message "WARNING" "Ungültige Auswahl. Bitte erneut versuchen."
+            ;;
+    esac
+done
 
 # --- Pfade setzen ---
 TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
@@ -210,17 +232,19 @@ else
     log_message "ERROR" "Konnte $TEMPLATE_C_DIR nach $retries Versuchen nicht vollständig bereinigen. Fahre mit dem Backup fort."
 fi
 
-# --- Webverzeichnis sichern (ohne media, mediafiles) ---
-log_message "INFO" "Sichere Webverzeichnis (ohne media, mediafiles)..."
-if ! tar --exclude="media" --exclude="mediafiles" -cf - -C "$HOME/public_html" "$PROJECT_DIR" | pigz -$COMPRESSION_LEVEL > "$WEB_BACKUP_FILE"; then
-    log_message "ERROR" "Fehler beim Webverzeichnis-Backup!"
-    exit 3
+# --- Webverzeichnis sichern (je nach Modus) ---
+if [[ "$BACKUP_MODE" == "all" || "$BACKUP_MODE" == "web_only" ]]; then
+    log_message "INFO" "Sichere Webverzeichnis (ohne media, mediafiles)..."
+    if ! tar --exclude="media" --exclude="mediafiles" -cf - -C "$HOME/public_html" "$PROJECT_DIR" | pigz -$COMPRESSION_LEVEL > "$WEB_BACKUP_FILE"; then
+        log_message "ERROR" "Fehler beim Webverzeichnis-Backup!"
+        exit 3
+    fi
+    verify_backup "$WEB_BACKUP_FILE"
+    log_message "SUCCESS" "Webverzeichnis-Backup erfolgreich: $(du -h "$WEB_BACKUP_FILE" | cut -f1)"
 fi
-verify_backup "$WEB_BACKUP_FILE"
-log_message "SUCCESS" "Webverzeichnis-Backup erfolgreich: $(du -h "$WEB_BACKUP_FILE" | cut -f1)"
 
-# --- Media-Verzeichnis separat sichern (nur im all-Modus) ---
-if [[ "$MODE" == "all" ]]; then
+# --- Media-Verzeichnis separat sichern (je nach Modus) ---
+if [[ "$BACKUP_MODE" == "all" || "$BACKUP_MODE" == "media_only" ]]; then
     log_message "INFO" "Sichere media-Verzeichnis separat..."
     if ! tar -cf - -C "$HOME/public_html/$PROJECT_DIR" "media" | pigz -$COMPRESSION_LEVEL > "$MEDIA_BACKUP_FILE"; then
         log_message "ERROR" "Fehler beim Media-Backup!"

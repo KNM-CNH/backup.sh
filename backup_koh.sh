@@ -63,12 +63,21 @@ verify_backup() {
 
 rotate_backups() {
     local project=$1
-    log_message "INFO" "Rotate Backups für $project (behalte die neuesten $MAX_BACKUPS)"
+    local project_backup_base="$BACKUP_ROOT/bak.${project}"
+    log_message "INFO" "Rotiere Backups für $project in $project_backup_base (behalte die neuesten $MAX_BACKUPS)"
 
-    # Lösche älteste Backups, behalte nur MAX_BACKUPS
-    find "$BACKUP_ROOT/bak.${project}" -name "${project}_*.tar.gz" -type f | sort -r | tail -n +$(($MAX_BACKUPS + 1)) | while read -r file; do
-        log_message "WARNING" "Lösche altes Backup: $file"
-        rm -f "$file"
+    # Finde alle Backup-Verzeichnisse, sortiere sie (neueste zuerst) und lösche die alten.
+    # tail -n +X starts printing from the X-th item.
+    local num_to_keep=$(($MAX_BACKUPS))
+    if [[ $num_to_keep -lt 1 ]]; then
+        log_message "WARNING" "MAX_BACKUPS ist auf 0 oder weniger gesetzt. Es werden alle Backups gelöscht!"
+    fi
+
+    find "$project_backup_base" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$(($num_to_keep + 1)) | while read -r backup_dir; do
+        if [[ -d "$backup_dir" ]]; then
+            log_message "WARNING" "Lösche altes Backup-Verzeichnis: $backup_dir"
+            rm -rf "$backup_dir"
+        fi
     done
 }
 
@@ -77,16 +86,21 @@ create_metadata() {
     local project=$2
     local metadata_file="$backup_dir/metadata.txt"
 
+    # Define file paths based on the new structure
+    local db_backup_path="$backup_dir/db_backup.sql"
+    local web_backup_path="$backup_dir/web_backup.tar.gz"
+    local media_backup_path="$backup_dir/media_backup.tar.gz"
+
     {
         echo "=== Backup Metadaten ==="
         echo "Projekt: $project"
         echo "Datum: $(date)"
         echo "Skript-Version: 2.0"
         echo "Komprimierungsstufe: $COMPRESSION_LEVEL"
-        echo "Größe DB-Backup: $(du -h "$backup_dir/${project}_db_backup.sql" | cut -f1)"
-        echo "Größe Web-Backup: $(du -h "$backup_dir/${project}_web_backup.tar.gz" | cut -f1)"
-        if [[ -f "$backup_dir/${project}_media_backup.tar.gz" ]]; then
-            echo "Größe Media-Backup: $(du -h "$backup_dir/${project}_media_backup.tar.gz" | cut -f1)"
+        echo "Größe DB-Backup: $(du -h "$db_backup_path" | cut -f1)"
+        echo "Größe Web-Backup: $(du -h "$web_backup_path" | cut -f1)"
+        if [[ -f "$media_backup_path" ]]; then
+            echo "Größe Media-Backup: $(du -h "$media_backup_path" | cut -f1)"
         fi
     } > "$metadata_file"
 }
@@ -124,11 +138,14 @@ else
 fi
 
 # --- Pfade setzen ---
+TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
 CONFIG_FILE="$HOME/public_html/${PROJECT_DIR}/includes/config.JTL-Shop.ini.php"
-BACKUP_DIR="$BACKUP_ROOT/bak.${PROJECT_DIR}"
-DB_BACKUP_FILE="$BACKUP_DIR/${PROJECT_DIR}_db_backup.sql"
-WEB_BACKUP_FILE="$BACKUP_DIR/${PROJECT_DIR}_web_backup.tar.gz"
-MEDIA_BACKUP_FILE="$BACKUP_DIR/${PROJECT_DIR}_media_backup.tar.gz"
+BACKUP_DIR_BASE="$BACKUP_ROOT/bak.${PROJECT_DIR}" # Base directory for project backups
+BACKUP_DIR="$BACKUP_DIR_BASE/$TIMESTAMP"         # Timestamped directory for this run
+
+DB_BACKUP_FILE="$BACKUP_DIR/db_backup.sql"
+WEB_BACKUP_FILE="$BACKUP_DIR/web_backup.tar.gz"
+MEDIA_BACKUP_FILE="$BACKUP_DIR/media_backup.tar.gz"
 
 # --- Backup-Verzeichnis erstellen VOR Logging ---
 mkdir -p "$BACKUP_DIR" || {
@@ -136,7 +153,7 @@ mkdir -p "$BACKUP_DIR" || {
     exit 1
 }
 
-LOG_FILE="$BACKUP_DIR/${PROJECT_DIR}_backup_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$BACKUP_DIR/backup.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log_message "INFO" "Backup-Verzeichnis angelegt: $BACKUP_DIR"
@@ -156,11 +173,42 @@ fi
 log_message "SUCCESS" "Datenbank-Backup erfolgreich: $(du -h "$DB_BACKUP_FILE" | cut -f1)"
 
 # --- templates_c bereinigen ---
-## TODO rm: cannot remove '/usr/home/tackle/public_html/tackle-deals.eu/templates_c/TACKLE_DEALS': Directory not empty (Fehler abfanngen und weitermachen, oder vorgang wiederholen und dann erst überspringen)
+## TODO gelöst: Fehler beim Löschen wird nun mit Wiederholungsversuchen behandelt.
 TEMPLATE_C_DIR="$HOME/public_html/${PROJECT_DIR}/templates_c"
-log_message "INFO" "Bereinige $TEMPLATE_C_DIR..."
-find "$TEMPLATE_C_DIR" -mindepth 1 -maxdepth 1 \! -name "min" \! -name ".htaccess" -exec rm -rf {} +
-log_message "SUCCESS" "Bereinigung abgeschlossen."
+log_message "INFO" "Bereinige Cache-Verzeichnis: $TEMPLATE_C_DIR..."
+
+retries=3
+success=false
+for ((i=1; i<=retries; i++)); do
+    # Führe den Befehl in einer Subshell aus, um 'set -e' temporär zu ignorieren.
+    # Leite Fehlermeldungen von find/rm um, da wir den Erfolg selbst prüfen.
+    (
+        set +e
+        find "$TEMPLATE_C_DIR" -mindepth 1 -maxdepth 1 \! -name "min" \! -name ".htaccess" -exec rm -rf {} + 2>/dev/null
+        # Prüfe, ob noch unerwünschte Dateien vorhanden sind.
+        remaining_items=$(find "$TEMPLATE_C_DIR" -mindepth 1 -maxdepth 1 \! -name "min" \! -name ".htaccess")
+        if [ -z "$remaining_items" ]; then
+            exit 0 # Erfolg
+        else
+            exit 1 # Fehler
+        fi
+    )
+    if [ $? -eq 0 ]; then
+        success=true
+        break
+    fi
+
+    if [ $i -lt $retries ]; then
+        log_message "WARNING" "Bereinigung fehlgeschlagen. Versuche erneut in 2 Sekunden... (Versuch $i/$retries)"
+        sleep 2
+    fi
+done
+
+if $success; then
+    log_message "SUCCESS" "Bereinigung von $TEMPLATE_C_DIR abgeschlossen."
+else
+    log_message "ERROR" "Konnte $TEMPLATE_C_DIR nach $retries Versuchen nicht vollständig bereinigen. Fahre mit dem Backup fort."
+fi
 
 # --- Webverzeichnis sichern (ohne media, mediafiles) ---
 log_message "INFO" "Sichere Webverzeichnis (ohne media, mediafiles)..."
@@ -195,6 +243,6 @@ echo "=== BACKUP ERFOLGREICH ABGESCHLOSSEN ==="
 echo "=============================================="
 echo -e "${NC}"
 log_message "SUCCESS" "Backup abgeschlossen!"
-log_message "INFO" "Backup-Details:"
-ls -lh "$BACKUP_DIR/${PROJECT_DIR}"_* | awk '{print "- " $9 " (" $5 ")"}'
+log_message "INFO" "Backup-Details in: $BACKUP_DIR"
+ls -lh "$BACKUP_DIR" | awk '{print "  - " $9 " (" $5 ")"}'
 echo -e "${LIGHT_BLUE}Log-Datei: $LOG_FILE${NC}"  # Jetzt hellblau
